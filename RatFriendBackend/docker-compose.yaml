@@ -1,0 +1,18 @@
+version: '3.1'
+
+services:
+  rat-friend-db:
+    container_name: rat-friend-db
+    image: postgres:latest
+    restart: always
+    environment:
+      - POSTGRES_USER=myuser
+      - POSTGRES_PASSWORD=secret
+      - POSTGRES_DB=rat_friend
+    ports:
+      - "6000:5432"
+    volumes:
+      - rat-friend-db-data:/var/lib/postgresql/data
+
+volumes:
+  rat-friend-db-data:
