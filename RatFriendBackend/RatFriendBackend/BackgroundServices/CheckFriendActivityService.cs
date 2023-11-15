@@ -2,23 +2,24 @@ using Microsoft.EntityFrameworkCore;
 using RatFriendBackend.HttpClients;
 using RatFriendBackend.Persistence;
 using RatFriendBackend.Persistence.Models;
-using SteamWebAPI2.Utilities;
-using Telegram.Bot;
 
 namespace RatFriendBackend.BackgroundServices;
 
 public class CheckFriendActivityService : IHostedService
 {
-    private readonly ISteamApiRefit _steamApiClient;
     private readonly IServiceProvider _serviceProvider;
-    private readonly TelegramBotClient _telegramBotClient;
+    private readonly ISteamApiClient _steamApiClient;
+    private const int TIME_BETWEEN_CHECK_FOR_NOTIFICATION_IN_MINUTES = 5;
+    private readonly SemaphoreSlim _checkFriendsActivitySemaphore = new SemaphoreSlim(1, 1);
+
+    //private readonly TelegramBotClient _telegramBotClient;
     private Timer _timer = null!;
 
-    public CheckFriendActivityService(ISteamApiRefit steamApiClient, IServiceProvider serviceProvider)
+    public CheckFriendActivityService(IServiceProvider serviceProvider, ISteamApiClient steamApiClient)
     {
-        _steamApiClient = steamApiClient;
         _serviceProvider = serviceProvider;
-        _telegramBotClient = new TelegramBotClient(Environment.GetEnvironmentVariable("TELEGRAM_BOT_TOKEN")!);
+        _steamApiClient = steamApiClient;
+        //        _telegramBotClient = new TelegramBotClient(Environment.GetEnvironmentVariable("TELEGRAM_BOT_TOKEN")!);
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -36,80 +37,58 @@ public class CheckFriendActivityService : IHostedService
 
     private async Task CheckFriendsActivity(CancellationToken stoppingToken)
     {
-        using (var scope = _serviceProvider.CreateScope())
-        {
-            var context = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+        await _checkFriendsActivitySemaphore.WaitAsync(stoppingToken);
+        using var scope = _serviceProvider.CreateScope();
 
-            var chunkSize = 100_000;
-            var subscriptionsCount =
-                await context.UserFriendActivities.LongCountAsync(cancellationToken: stoppingToken);
-            for (int i = 0; i < subscriptionsCount / chunkSize; i++)
+        var context = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+
+        var friendActivities = await context.FriendActivities
+            .Include(x => x.FriendActivitySubscriptions)!
+            .ThenInclude(x => x.UserSubscription)
+            .GroupBy(x => x.FriendId)
+            .ToListAsync(cancellationToken: stoppingToken);
+
+        foreach (var friendActivity in friendActivities)
+        {
+            var lastTimeUserActivity = friendActivity.ToDictionary(x => x.AppId, x => x);
+            var recentlyPlayedGames =
+                (await _steamApiClient.GetRecentlyPlayedGamesAsync(friendActivity.First().FriendId))
+                .RecentlyPlayedGames.ToDictionary(x => x.AppId, x => x.PlaytimeForever);
+            var gamesSubscribedTo =
+                recentlyPlayedGames.IntersectBy(friendActivity.Select(x => x.AppId), x => x.Key);
+            foreach (var game in gamesSubscribedTo)
             {
-                var subscriptions = await context.UserFriendActivities
-                    .Include(x => x.User)
-                    .Include(x => x.FriendActivityInfo)
-                    .Skip(i * chunkSize)
-                    .Take(chunkSize)
-                    .DistinctBy(x => x.User!.ApiToken)
-                    .ToListAsync(cancellationToken: stoppingToken);
+                if (recentlyPlayedGames[game.Key] - lastTimeUserActivity[game.Key].TimePlayed >=
+                    TIME_BETWEEN_CHECK_FOR_NOTIFICATION_IN_MINUTES)
+                {
+                    // Смотрим по всем играм
+                    foreach (FriendActivity activity in friendActivity)
+                    {
+                        var subscribers = activity.FriendActivitySubscriptions!
+                            .Where(x => x.UserSubscription!.IsFollowing)
+                            .ToList();
+                        foreach (var subscriber in subscribers.Select(x => x.UserSubscription))
+                        {
+                            Console.WriteLine(
+                                $"Твой друг: {activity.FriendName} играет в {activity.AppName} без тебя!\n" +
+                                $"Пора оставить ему \"добрый\" комментарий!");
+                            // Шлем сообщение в тг
+                            /*_telegramBotClient.SendTextMessageAsync(
+                                    subscriber.UserId,
+                                    $"Твой друг: {activity.FriendName} играет в {activity.AppName}!\n" +
+                                    $"Пора оставить ему \"добрый\" комментарий!");
+                                subscriber.UserId*/
+                        }
 
-                await Parallel.ForEachAsync(subscriptions, stoppingToken,
-                    async (userFriendActivity, _) => { await ProcessCurrentFriendActivity(userFriendActivity); });
-
-                await context.SaveChangesAsync(cancellationToken: stoppingToken);
+                        activity.TimePlayed = recentlyPlayedGames[activity.AppId];
+                    }
+                }
             }
-        }
-    }
 
-    private async Task ProcessCurrentFriendActivity(UserFriendActivity userFriendActivity)
-    {
-        var curGamesInfo = (await _steamApiClient.GetRecentlyPlayedGamesAsync(
-                userFriendActivity.User!.ApiToken,
-                userFriendActivity.FriendId)).RecentlyPlayedGamesResponse.Games
-            .Select(g => new GamesInfo(g.name, g.appid, g.playtime_forever))
-            .ToList();
-        var prevGamesInfo = userFriendActivity.FriendActivityInfo!.GameInfos;
-        var gameThatFriendPlayedWithoutUs = GetGameNameThatUserPlayNow(prevGamesInfo, curGamesInfo);
-        var friendPlayWithoutUs = gameThatFriendPlayedWithoutUs == null;
-        var friendStillPlayingWithoutUs = userFriendActivity.FriendActivityInfo.StillPlayingWithoutUs;
-
-        if (friendPlayWithoutUs)
-        {
-            userFriendActivity.FriendActivityInfo.LastPlayTime = DateTime.UtcNow.ToUnixTimeStamp();
+            await context.SaveChangesAsync(stoppingToken);
         }
 
-        if (friendPlayWithoutUs && !friendStillPlayingWithoutUs)
-        {
-            userFriendActivity.FriendActivityInfo.StillPlayingWithoutUs = true;
-            await _telegramBotClient.SendTextMessageAsync(
-                userFriendActivity.User.TelegramId,
-                "Ваш друг играет в " + gameThatFriendPlayedWithoutUs + "!"
-            );
-        }
-        else if (!friendPlayWithoutUs && friendStillPlayingWithoutUs)
-        {
-            userFriendActivity.FriendActivityInfo.StillPlayingWithoutUs = false;
-        }
-
-        userFriendActivity.FriendActivityInfo.GameInfos = curGamesInfo;
-    }
-
-    private string? GetGameNameThatUserPlayNow(List<GamesInfo> prevGamesInfos, List<GamesInfo> curGamesInfos)
-    {
-        var newGames = curGamesInfos.ExceptBy(prevGamesInfos.Select(x => x.GameId), x => x.GameId).ToList();
-        if (newGames.Any())
-            return newGames.First().Name;
-        
-        var sameGames = curGamesInfos.IntersectBy(prevGamesInfos.Select(x => x.GameId), x => x.GameId);
-        var prevGamesInfosDict = prevGamesInfos.ToDictionary(x => x.GameId, x => x);
-        foreach (var curGameInfo in sameGames)
-        {
-            var prevGameInfo = prevGamesInfosDict[curGameInfo.GameId];
-
-            if (curGameInfo.PlayTimeForever > prevGameInfo.PlayTimeForever)
-                return curGameInfo.Name;
-        }
-
-        return null;
+        await context.SaveChangesAsync(stoppingToken);
+        _checkFriendsActivitySemaphore.Release();
     }
 }

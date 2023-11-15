@@ -1,3 +1,3 @@
 namespace RatFriendBackend.Requests;
 
-public record GetUserProfileRequest(string SteamApiKey, ulong SteamId);
+public record GetUserProfileRequest(string SteamApiKey, List<ulong> SteamIds);

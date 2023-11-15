@@ -5,9 +5,9 @@ namespace RatFriendBackend.Persistence;
 
 public class ApplicationDbContext : DbContext
 {
-    public DbSet<User> Users { get; set; } = null!;
-    public DbSet<FriendActivityInfo> FriendActivityInfos { get; set; } = null!;
-    public DbSet<UserFriendActivity> UserFriendActivities { get; set; } = null!;
+    public DbSet<UserSubscription> UserSubscription { get; set; } = null!;
+    public DbSet<FriendActivitySubscription> FriendActivitySubscriptions { get; set; } = null!;
+    public DbSet<FriendActivity> FriendActivities { get; set; } = null!;
 
     public ApplicationDbContext(DbContextOptions<ApplicationDbContext> options) : base(options)
     {
@@ -15,6 +15,7 @@ public class ApplicationDbContext : DbContext
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
-        modelBuilder.Entity<UserFriendActivity>().HasKey(e => new { e.UserId, FriendGamesInfoId = e.FriendId });
+        modelBuilder.Entity<UserSubscription>().HasIndex(e => new { e.UserId, e.FriendId }).IsUnique();
+        modelBuilder.Entity<FriendActivity>().HasIndex(e => new { e.FriendId, e.AppId, }).IsUnique();
     }
 }

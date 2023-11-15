@@ -22,6 +22,7 @@ public static class DependencyInjection
 
     private static IServiceCollection RegisterServices(this IServiceCollection services)
     {
+        services.AddSingleton<ISteamApiClient, SteamApiClient>();
         return services;
     }
 
