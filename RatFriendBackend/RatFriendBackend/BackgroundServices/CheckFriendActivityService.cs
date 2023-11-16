@@ -1,7 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using RatFriendBackend.HttpClients;
 using RatFriendBackend.Persistence;
-using RatFriendBackend.Persistence.Models;
+using Telegram.Bot;
 
 namespace RatFriendBackend.BackgroundServices;
 
@@ -9,24 +9,24 @@ public class CheckFriendActivityService : IHostedService
 {
     private readonly IServiceProvider _serviceProvider;
     private readonly ISteamApiClient _steamApiClient;
-    private const int TIME_BETWEEN_CHECK_FOR_NOTIFICATION_IN_MINUTES = 5;
+    private const int TIME_BETWEEN_CHECK_FOR_NOTIFICATION_IN_MINUTES = 1;
     private readonly SemaphoreSlim _checkFriendsActivitySemaphore = new SemaphoreSlim(1, 1);
-
-    //private readonly TelegramBotClient _telegramBotClient;
     private Timer _timer = null!;
+    
+    private readonly TelegramBotClient _telegramBotClient;
 
     public CheckFriendActivityService(IServiceProvider serviceProvider, ISteamApiClient steamApiClient)
     {
         _serviceProvider = serviceProvider;
         _steamApiClient = steamApiClient;
-        //        _telegramBotClient = new TelegramBotClient(Environment.GetEnvironmentVariable("TELEGRAM_BOT_TOKEN")!);
+        _telegramBotClient = new TelegramBotClient(Environment.GetEnvironmentVariable("TELEGRAM_BOT_TOKEN")!);
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
         // Create timer with 1 minute interval and doesn't start next tick until previous is finished
         _timer = new Timer(async _ => await CheckFriendsActivity(cancellationToken), null, TimeSpan.Zero,
-            TimeSpan.FromMinutes(1));
+            TimeSpan.FromMinutes(TIME_BETWEEN_CHECK_FOR_NOTIFICATION_IN_MINUTES));
         return Task.CompletedTask;
     }
 
@@ -42,46 +42,50 @@ public class CheckFriendActivityService : IHostedService
 
         var context = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
 
-        var friendActivities = await context.FriendActivities
+        var friendsActivities = await context.FriendActivities
             .Include(x => x.FriendActivitySubscriptions)!
             .ThenInclude(x => x.UserSubscription)
             .GroupBy(x => x.FriendId)
             .ToListAsync(cancellationToken: stoppingToken);
 
-        foreach (var friendActivity in friendActivities)
+        foreach (var friendActivities in friendsActivities)
         {
-            var lastTimeUserActivity = friendActivity.ToDictionary(x => x.AppId, x => x);
+            var lastTimeUserActivity = friendActivities.ToDictionary(x => x.AppId, x => x);
             var recentlyPlayedGames =
-                (await _steamApiClient.GetRecentlyPlayedGamesAsync(friendActivity.First().FriendId))
+                (await _steamApiClient.GetRecentlyPlayedGamesAsync(friendActivities.First().FriendId))
                 .RecentlyPlayedGames.ToDictionary(x => x.AppId, x => x.PlaytimeForever);
             var gamesSubscribedTo =
-                recentlyPlayedGames.IntersectBy(friendActivity.Select(x => x.AppId), x => x.Key);
+                recentlyPlayedGames.IntersectBy(friendActivities.Select(x => x.AppId), x => x.Key);
             foreach (var game in gamesSubscribedTo)
             {
-                if (recentlyPlayedGames[game.Key] - lastTimeUserActivity[game.Key].TimePlayed >=
-                    TIME_BETWEEN_CHECK_FOR_NOTIFICATION_IN_MINUTES)
+                if (recentlyPlayedGames[game.Key] > lastTimeUserActivity[game.Key].TimePlayed)
                 {
                     // Смотрим по всем играм
-                    foreach (FriendActivity activity in friendActivity)
-                    {
-                        var subscribers = activity.FriendActivitySubscriptions!
-                            .Where(x => x.UserSubscription!.IsFollowing)
-                            .ToList();
-                        foreach (var subscriber in subscribers.Select(x => x.UserSubscription))
-                        {
-                            Console.WriteLine(
-                                $"Твой друг: {activity.FriendName} играет в {activity.AppName} без тебя!\n" +
-                                $"Пора оставить ему \"добрый\" комментарий!");
-                            // Шлем сообщение в тг
-                            /*_telegramBotClient.SendTextMessageAsync(
-                                    subscriber.UserId,
-                                    $"Твой друг: {activity.FriendName} играет в {activity.AppName}!\n" +
-                                    $"Пора оставить ему \"добрый\" комментарий!");
-                                subscriber.UserId*/
-                        }
+                    var activityForNotification = friendActivities.First(x => x.AppId == game.Key);
 
-                        activity.TimePlayed = recentlyPlayedGames[activity.AppId];
+                    var subscribers = activityForNotification.FriendActivitySubscriptions!
+                        .Where(x => x.UserSubscription!.IsFollowing)
+                        .ToList();
+                    foreach (var subscriber in subscribers.Select(x => x.UserSubscription))
+                    {
+                        Console.WriteLine(
+                            $"Твой друг: {activityForNotification.FriendName} ({activityForNotification.ProfileUrl}) играет в {activityForNotification.AppName} без тебя!\n" +
+                            $"Пора оставить ему \"добрый\" комментарий!");
+                        // Шлем сообщение в тг
+                        try
+                        {
+                            await _telegramBotClient.SendTextMessageAsync(
+                                subscriber.UserId,
+                                $"Твой друг: {activityForNotification.FriendName} играет в {activityForNotification.AppName}!\n" +
+                                $"Пора оставить ему \"добрый\" комментарий!", cancellationToken: stoppingToken);
+                        }
+                        catch (Exception e)
+                        {
+                            Console.WriteLine($"Can't send message to {subscriber.UserId}");
+                        }
                     }
+
+                    activityForNotification.TimePlayed = recentlyPlayedGames[activityForNotification.AppId];
                 }
             }
 

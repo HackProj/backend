@@ -1,12 +1,10 @@
+using System.Net;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using RatFriendBackend.HttpClients;
 using RatFriendBackend.Persistence;
 using RatFriendBackend.Persistence.Models;
 using RatFriendBackend.Requests;
-using Steam.Models.SteamCommunity;
-using SteamWebAPI2.Interfaces;
-using SteamWebAPI2.Utilities;
 
 namespace RatFriendBackend.Controllers;
 
@@ -22,15 +20,129 @@ public class UsersController : ControllerBase
         _steamApiClient = steamApiClient;
     }
 
+    [HttpGet("subscriptions")]
+    public async Task<IActionResult> GetUserSubscriptions(long userId)
+    {
+        var userSubscriptions = await _context.FriendActivitySubscriptions
+            .Include(x => x.UserSubscription)
+            .Include(x => x.FriendActivity)
+            .Where(x => x.UserSubscription!.UserId == userId)
+            .Select(x => x.FriendActivity)
+            .ToListAsync();
+
+        if (userSubscriptions.Count <= 0)
+            return NotFound("User with specified id not found");
+
+        return Ok(userSubscriptions.DistinctBy(x => x!.FriendId)
+            .Select(x => new
+                {
+                    x!.FriendName,
+                    x.ProfileUrl
+                }
+            ));
+    }
+
+    [HttpGet("subscriptions/friend")]
+    public async Task<IActionResult> GetUserSubscriptions(long userId, string friendUrl)
+    {
+        var (friendId, errorMsg) = await GetUserIdByUrl(friendUrl);
+        if (friendId == null)
+            return BadRequest(errorMsg);
+
+        var userSubscriptions = await _context.FriendActivitySubscriptions
+            .Include(x => x.UserSubscription)
+            .Include(x => x.FriendActivity)
+            .Where(x => x.UserSubscription!.UserId == userId && x.FriendActivity!.FriendId == friendId)
+            .Select(x => x.FriendActivity)
+            .ToListAsync();
+
+        if (userSubscriptions.Count <= 0)
+            return NotFound("User with specified id not found");
+
+        return Ok(userSubscriptions.Select(x => new
+                {
+                    x!.FriendName,
+                    x.ProfileUrl,
+                    x.AppName,
+                }
+            ));
+    }
+
+    [HttpDelete("subscription/friend")]
+    public async Task<IActionResult> DeleteUserSubscription(RemoveAllSubscriptionWithFriendRequest request)
+    {
+        var (friendId, errorMsg) = await GetUserIdByUrl(request.FriendUrl);
+        if (friendId == null)
+            return BadRequest(errorMsg);
+
+        var userSubscriptions = await _context.FriendActivitySubscriptions
+            .Include(x => x.UserSubscription)
+            .Include(x => x.FriendActivity)
+            .Where(x =>
+                x.UserSubscription!.UserId == request.UserId
+                && x.FriendActivity!.FriendId == friendId)
+            .ToListAsync();
+
+        _context.FriendActivitySubscriptions.RemoveRange(userSubscriptions);
+        _context.UserSubscription.RemoveRange(userSubscriptions.Select(x => x.UserSubscription)!);
+        _context.FriendActivities.RemoveRange(userSubscriptions.Select(x => x.FriendActivity)!);
+        await _context.SaveChangesAsync();
+        return Ok();
+    }
+
+    [HttpDelete("subscription/game")]
+    public async Task<IActionResult> DeleteUserSubscription(RemoveSubscriptionRequest request)
+    {
+        var (friendId, errorMsg) = await GetUserIdByUrl(request.FriendUrl);
+        if (friendId == null)
+            return BadRequest(errorMsg);
+
+        var userSubscriptions = await _context.FriendActivitySubscriptions
+            .Include(x => x.UserSubscription)
+            .Include(x => x.FriendActivity)
+            .Where(x =>
+                x.UserSubscription!.UserId == request.UserId
+                && x.FriendActivity!.FriendId == friendId
+                && x.FriendActivity.AppName == request.AppName)
+            .ToListAsync();
+
+        _context.FriendActivities.RemoveRange(userSubscriptions.Select(x => x.FriendActivity)!);
+        await _context.SaveChangesAsync();
+        return Ok();
+    }
+
+    [HttpPut("subscribeStatus")]
+    [ProducesResponseType(typeof(string), (int)HttpStatusCode.NotFound)]
+    [ProducesResponseType((int)HttpStatusCode.OK)]
+    public async Task<IActionResult> ChangeSubscribeStatus(DisableNotificationRequest request)
+    {
+        var (friendId, errorMsg) = await GetUserIdByUrl(request.FriendUrl);
+        if (friendId == null)
+            return BadRequest(errorMsg);
+        
+        await CreateUserSubscriptionIfNotExists(friendId.Value, request.TelegramId);
+
+        var userSubscription = await _context.UserSubscription
+            .FirstOrDefaultAsync(x => x.UserId == request.TelegramId && x.FriendId == friendId);
+
+        if (userSubscription == null)
+            return NotFound("User is not subscribed to this friend");
+
+        userSubscription.IsFollowing = request.IsEnabled;
+        await _context.SaveChangesAsync();
+
+        return Ok();
+    }
+
     [HttpPost("subscribe")]
+    [ProducesResponseType(typeof(string), (int)HttpStatusCode.BadRequest)]
+    [ProducesResponseType((int)HttpStatusCode.OK)]
     public async Task<IActionResult> Subscribe(SubscribeToUserRequest request)
     {
-        var userName = GetUserNameFromUrl(request.FriendUrl);
-        if (userName == null)
-            return BadRequest("Invalid friend url");
-
-        var friendId = await _steamApiClient.ResolveVanityUrlAsync(userName);
-        await CreateUserSubscriptionIfNotExists(friendId, request.TelegramId);
+        var (friendId, errorMsg) = await GetUserIdByUrl(request.FriendUrl);
+        if (friendId == null)
+            return BadRequest(errorMsg);
+        await CreateUserSubscriptionIfNotExists(friendId.Value, request.TelegramId);
 
         var appName = GetAppNameFromUrl(request.AppUrl);
         if (appName == null)
@@ -40,15 +152,24 @@ public class UsersController : ControllerBase
         if (appId == null)
             return BadRequest("Invalid app url");
 
-        var errorMsg = await CreateFriendActivitiesIfNotExists(appId.Value, appName, friendId);
+        errorMsg = await CreateFriendActivitiesIfNotExists(appId.Value, appName, friendId.Value);
         if (errorMsg != null)
             return BadRequest(errorMsg);
 
         await _context.SaveChangesAsync();
-        await CreateFriendActivitySubscriptionIfNotExists(friendId, request.TelegramId, appId.Value);
+        await CreateFriendActivitySubscriptionIfNotExists(friendId.Value, request.TelegramId, appId.Value);
         await _context.SaveChangesAsync();
 
         return Ok();
+    }
+
+    private async Task<(ulong? userId, string msg)> GetUserIdByUrl(string friendUrl)
+    {
+        var userName = GetUserNameFromUrl(friendUrl);
+        if (userName == null)
+            return (null, "Invalid friend url");
+
+        return (await _steamApiClient.ResolveVanityUrlAsync(userName), string.Empty);
     }
 
     private async Task CreateUserSubscriptionIfNotExists(ulong friendId, long telegramId)
@@ -72,18 +193,20 @@ public class UsersController : ControllerBase
                 x.FriendId == friendId && x.AppId == appId) != null)
             return null;
 
-        var app = await GetRecentlyPlayedGamesAsync(friendId, appId);
+        var app = (await _steamApiClient.GetOwnedGamesAsync(friendId)).OwnedGames
+            .FirstOrDefault(x => x.AppId == appId);
         if (app == null)
             return "User doesn't own this game";
 
-        var friendName = (await _steamApiClient.GetPlayerSummariesAsync(friendId)).First().Nickname;
-        _context.FriendActivities.Add(new FriendActivity()
+        var friend = (await _steamApiClient.GetPlayerSummariesAsync(friendId)).First();
+        _context.FriendActivities.Add(new FriendActivity
         {
             FriendId = friendId,
-            FriendName = friendName,
+            FriendName = friend.Nickname,
+            ProfileUrl = friend.ProfileUrl,
             AppName = appName,
             AppId = appId,
-            TimePlayed = app.PlaytimeForever
+            TimePlayed = (uint)app.PlaytimeForever.TotalMinutes
         });
 
         return null;
@@ -109,14 +232,6 @@ public class UsersController : ControllerBase
         }
     }
 
-    private static async Task<RecentlyPlayedGameModel?> GetRecentlyPlayedGamesAsync(ulong friendId, ulong appId)
-    {
-        SteamWebInterfaceFactory steamWebInterfaceFactory = new(Constants.SteamApiToken);
-        var steamClient = steamWebInterfaceFactory.CreateSteamWebInterface<PlayerService>(new HttpClient());
-        return (await steamClient.GetRecentlyPlayedGamesAsync(friendId)).Data.RecentlyPlayedGames.FirstOrDefault(x =>
-            x.AppId == appId);
-    }
-
     private uint? GetAppIdFromUrl(string appUrl)
     {
         Uri uri = new Uri(appUrl);
@@ -140,6 +255,9 @@ public class UsersController : ControllerBase
 
     private string? GetUserNameFromUrl(string friendUrl)
     {
+        if (!Uri.IsWellFormedUriString(friendUrl, UriKind.Absolute))
+            return null;
+
         var clearedUrl = friendUrl.TrimEnd('/');
         var lastSlashIndex = clearedUrl.LastIndexOf('/');
         try

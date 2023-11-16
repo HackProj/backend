@@ -6,7 +6,7 @@ using SteamWebAPI2.Utilities;
 
 namespace RatFriendBackend.Controllers;
 
-[Microsoft.AspNetCore.Components.Route("api/[controller]")]
+[Route("api/[controller]")]
 public class SteamApiController : ControllerBase
 {
     [HttpGet("playerSummaries")]

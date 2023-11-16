@@ -44,6 +44,6 @@ public class SteamApiClient : ISteamApiClient
 
     public async Task<OwnedGamesResultModel> GetOwnedGamesAsync(ulong steamId)
     {
-        return (await _playerService.GetOwnedGamesAsync(steamId)).Data;
+        return (await _playerService.GetOwnedGamesAsync(steamId, includeFreeGames: true)).Data;
     }
 }

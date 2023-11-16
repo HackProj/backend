@@ -13,6 +13,18 @@ services:
       - "6000:5432"
     volumes:
       - rat-friend-db-data:/var/lib/postgresql/data
+  rat-friend-backend:
+    container_name: rat-friend-backend
+    image: gonarch/rat-friend-backend
+    depends_on: 
+      - rat-friend-db
+    restart: always
+    environment:
+      - TELEGRAM_BOT_TOKEN=6431296408:AAHHLwIOixvrrRMG0gfbs5M_tZvb1cZzBOk
+      - STEAM_API_TOKEN=E81CB9C4807B5DA6CED7A4B3B8CECFCF
+      - CONNECTION_STRING=Host=rat-friend-db;Port=5432;Database=rat_friend;Username=myuser;Password=secret
+    ports:
+      - "6001:80"
 
 volumes:
   rat-friend-db-data:

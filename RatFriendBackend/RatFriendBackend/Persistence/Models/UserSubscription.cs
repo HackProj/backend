@@ -7,4 +7,5 @@ public class UserSubscription
     public ulong FriendId { get; set; }
     public bool IsFollowing { get; set; }
     public bool WantHint { get; set; }
+    public IList<FriendActivitySubscription>? FriendActivitySubscriptions { get; set; }
 }
